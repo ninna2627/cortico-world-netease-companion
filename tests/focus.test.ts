@@ -42,3 +42,28 @@ test('用户画像和听歌记忆可作为侧重', () => {
   assert.equal(chooseFocus(input({ segmentIndex: 1, memoryStatus: 'ok' }), new Set()).key, 'memory');
   assert.equal(chooseFocus(input({ preferenceCount: 2 }), new Set()).key, 'profile');
 });
+
+test('跨曲轮换：开场避开最近几首用过的角度，并在靠前候选里随机', async () => {
+  const { chooseFocus: choose } = await import('../src/focus.ts');
+  const bg = background({ wiki: { genres: [], tags: [], awards: [], appearances: ['某番剧'], similar: [], playlists: [], url: '', fetchedAt: '' } });
+  const rich = input({ background: bg, artistStatus: 'ok', excerptCount: 3 });
+  // 最近用过影视引用和创作背景，就不再从它们开始。
+  const picked = choose(rich, new Set(), { recent: ['appearance', 'creation'], random: () => 0 });
+  assert.equal(picked.key, 'artist');
+  // 随机数决定在前几个候选里挑哪一个，最多看 4 个。
+  assert.equal(choose(rich, new Set(), { recent: [], random: () => 0.99 }).key, 'album');
+  // 所有候选都在 recent 里时仍然有结果，不会卡住。
+  assert.equal(choose(input(), new Set(), { recent: ['mood', 'scene'], random: () => 0 }).key, 'mood');
+  // 分段不受跨曲轮换影响。
+  assert.equal(choose(input({ segmentIndex: 0 }), new Set(), { recent: ['mood'], random: () => 0.99 }).key, 'mood');
+});
+
+test('表达形式：不连续重复，低互动时不选提问', async () => {
+  const { chooseDelivery } = await import('../src/focus.ts');
+  for (const r of [0, 0.3, 0.6, 0.99]) {
+    assert.notEqual(chooseDelivery('reaction', () => r).key, 'reaction');
+    assert.notEqual(chooseDelivery(undefined, () => r, false).key, 'question');
+  }
+  const seen = new Set([0, 0.2, 0.4, 0.6, 0.8].map(r => chooseDelivery(undefined, () => r).key));
+  assert.equal(seen.size, 5);
+});

@@ -71,18 +71,48 @@ function available(key: FocusKey, input: FocusInput): boolean {
   }
 }
 
-/** 按开场/分段序号轮换侧重；跳过本首已经用过或数据不足的角度。 */
-export function chooseFocus(input: FocusInput, used: ReadonlySet<FocusKey>): CommentFocus {
+/** 跨曲轮换的选项：recent 是最近几首开场用过的角度，random 用于在候选里随机挑。 */
+export interface FocusRotation {
+  recent: readonly FocusKey[];
+  random: () => number;
+}
+
+/**
+ * 按开场/分段序号轮换侧重；跳过本首已经用过或数据不足的角度。
+ * 给了 rotation 时，开场不再总从同一个角度开始：避开最近几首开场用过的角度，
+ * 并在排序靠前的几个可用角度里随机挑一个（个人 Linux 版：减少每首歌同一套句式）。
+ */
+export function chooseFocus(input: FocusInput, used: ReadonlySet<FocusKey>, rotation?: FocusRotation): CommentFocus {
   const order = input.segmentIndex < 0
     ? OPENING
     : (SEGMENTS[Math.min(input.segmentIndex, SEGMENTS.length - 1)] ?? SEGMENTS[0]);
-  for (const key of order) {
-    if (!used.has(key) && available(key, input))
-      return { key, label: LABELS[key], instruction: INSTRUCTIONS[key] };
+  const make = (key: FocusKey): CommentFocus => ({ key, label: LABELS[key], instruction: INSTRUCTIONS[key] });
+  const usable = order.filter(key => !used.has(key) && available(key, input));
+  if (rotation && input.segmentIndex < 0 && usable.length) {
+    const fresh = usable.filter(key => !rotation.recent.includes(key));
+    const pool = (fresh.length ? fresh : usable).slice(0, 4);
+    return make(pool[Math.min(pool.length - 1, Math.floor(rotation.random() * pool.length))]);
   }
+  if (usable.length) return make(usable[0]);
   for (const key of Object.keys(LABELS) as FocusKey[]) {
-    if (key !== 'variation' && !used.has(key) && available(key, input))
-      return { key, label: LABELS[key], instruction: INSTRUCTIONS[key] };
+    if (key !== 'variation' && !used.has(key) && available(key, input)) return make(key);
   }
-  return { key: 'variation', label: LABELS.variation, instruction: INSTRUCTIONS.variation };
+  return make('variation');
+}
+
+export type DeliveryKey = 'reaction' | 'detail' | 'question' | 'image' | 'aside';
+export interface Delivery { key: DeliveryKey; instruction: string }
+const DELIVERIES: Record<DeliveryKey, string> = {
+  reaction: '表达形式：一句很短的即时反应（十几个字以内），像脱口而出，不讲知识点。',
+  detail: '表达形式：讲一个具体的小细节，再带半句你自己的感受；细节必须来自数据。',
+  question: '表达形式：用一个轻松、容易接的小问题收尾，问用户的感受或此刻在做什么；不追问，也不连续提问。',
+  image: '表达形式：用一个画面或比喻说出此刻听到的感觉，不报事实参数。',
+  aside: '表达形式：像自言自语的随口一句，不面向用户解释，也不总结。',
+};
+/** 每次开场换一种表达形式，避免连续两次相同；低互动画像不选提问。 */
+export function chooseDelivery(last: DeliveryKey | undefined, random: () => number, allowQuestion = true): Delivery {
+  const keys = (Object.keys(DELIVERIES) as DeliveryKey[])
+    .filter(key => key !== last && (allowQuestion || key !== 'question'));
+  const key = keys[Math.min(keys.length - 1, Math.floor(random() * keys.length))];
+  return { key, instruction: DELIVERIES[key] };
 }

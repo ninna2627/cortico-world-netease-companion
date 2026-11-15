@@ -571,3 +571,37 @@ test('配置分组只暴露官方播放器优先级与通用识别，功能标�
   assert.equal(props['worlds.netease-music.sessionPattern'], undefined);
   assert.equal(props['worlds.netease-music.windowFallbackProcess'], undefined);
 });
+
+test('个人版：报幕只偶尔出现且不连续，承接上一首需要同歌手/同专辑', () => {
+  const cfg = defaults();
+  const world = new MusicWorld(cfg, patch => Object.assign(cfg, patch)) as any;
+  const track = (title: string, artist: string, album = ''): any =>
+    ({ title, artist, album, app: 'SPlayer', player: 'netease', status: 'playing', method: 'smtc' });
+  // 刚报过幕的下一首不抽随机数，所以序列是：第 1 首 0.1、第 3 首 0.9、第 4 首 0.1。
+  const rolls = [0.1, 0.9, 0.1];
+  world.random = () => rolls.shift() ?? 0.9;
+  const first = world.announceHint(track('a', '歌手'));
+  const second = world.announceHint(track('b', '歌手'));
+  assert.match(first, /可以顺带点出/);
+  // 不再给“是周杰伦的《晴天》呀”这类可被照抄的例句。
+  assert.doesNotMatch(first, /周杰伦|晴天/);
+  // 刚报过幕，下一首即使抽中也不报。
+  assert.match(second, /不要报歌名/);
+  assert.match(world.announceHint(track('c', '歌手')), /不要报歌名/);
+  assert.match(world.announceHint(track('d', '歌手')), /可以顺带点出/);
+  // 没有歌手名或关掉报幕时不报。
+  world.random = () => 0;
+  world.openingsSinceAnnounce = 5;
+  assert.match(world.announceHint(track('e', '')), /不要报歌名/);
+  cfg.announceTracks = false;
+  world.openingsSinceAnnounce = 5;
+  assert.match(world.announceHint(track('f', '歌手')), /不要报歌名/);
+
+  const now = 10 * 60_000;
+  world.random = () => 0.1;
+  assert.equal(world.carriesOver(track('a', '甲', '专辑'), track('b', '乙', '专辑'), now - 60_000, now), true);
+  assert.equal(world.carriesOver(track('a', '甲'), track('b', '乙'), now - 60_000, now), false);
+  assert.equal(world.carriesOver(track('a', '甲'), track('b', '甲'), now - 6 * 60_000, now), false);
+  world.random = () => 0.9;
+  assert.equal(world.carriesOver(track('a', '甲'), track('b', '甲'), now - 60_000, now), false);
+});
