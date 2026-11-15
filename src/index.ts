@@ -6,7 +6,7 @@ import { MusicWorld, toolDecls } from './world.ts';
 const definition: WorldDefinition<MusicConfig> = {
   id: 'netease-music', label: '听搭子', defaults,
   preflight(ctx) {
-    if (process.platform !== 'win32') throw new Error('此版本需要 Windows 10 1809+ / Windows 11');
+    if (process.platform !== 'linux') throw new Error('此版本（个人 Linux fork）需要 Linux 与 D-Bus 会话总线上的 MPRIS');
     const customPlayers = parseCustomPlayers(ctx.cfg.customPlayers);
     if (JSON.stringify(customPlayers) !== JSON.stringify(ctx.cfg.customPlayers ?? [])) ctx.persist({ customPlayers });
     // 优先级只保留官方项与仍然保存着的自定义项；旧配置自动补齐，删除后不留残项。

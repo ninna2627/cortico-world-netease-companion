@@ -19,7 +19,7 @@ const history: ListeningHistory = {
       { name: '买辣椒也用券', count: 1, lastAt: '2026-10-28T11:00:00.000Z' },
     ],
     hours: Array(24).fill(0).map((_, hour) => hour === 10 ? 4 : hour === 11 ? 1 : 0),
-    players: [{ app: 'cloudmusic', count: 4 }, { app: 'QQMusic', count: 1 }],
+    players: [{ app: 'SPlayer', count: 4 }, { app: 'firefox', count: 1 }],
   }],
 };
 
@@ -33,10 +33,10 @@ test('口味档案汇总常听歌手、曲风、循环曲、时段、播放器�
   assert.equal(taste.topGenres[0].count, 4);
   assert.deepEqual(taste.repeatTracks.map(item => item.title), ['晴天']);
   assert.equal(taste.hours.find(item => item.hour === 10)?.count, 4);
-  assert.equal(taste.players[0].app, 'cloudmusic');
+  assert.equal(taste.players[0].app, 'SPlayer');
   assert.equal(taste.players[0].share, 0.8);
   assert.ok(taste.tags.includes('循环型'));
-  assert.ok(taste.tags.includes('常用网易云音乐'));
+  assert.ok(taste.tags.includes('常用SPlayer（网易云）'));
   assert.ok(taste.tags.includes('曲风偏流行'));
   assert.ok(taste.tags.includes('最活跃 10:00'));
   assert.match(taste.summary, /5 次播放/);

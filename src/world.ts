@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process';
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
@@ -7,16 +7,17 @@ import { fileURLToPath } from 'node:url';
 import type { StoragePart, ToolDef, World, WorldHost, WorldWebUiDecl } from 'cortico/core/types.ts';
 import {
   autoLabel, autoPlayerId, configGroups, commentLimits, customPlayerIds, isBlacklistedApp, isAutoPlayer, lyricLimits,
-  listeningLimits, matchPlayer, normalizeConfigPatch, parseAutoBlacklist, parseCustomPlayers, PLAYERS, playerEnv,
+  listeningLimits, matchPlayer, normalizeConfigPatch, parseAutoBlacklist, parseCustomPlayers, PLAYERS,
   playerOrder, segmentLimits, type MusicConfig,
 } from './config.ts';
-import { WindowsReader, type Reader, type ReaderDiagnostics } from './reader.ts';
+import { MprisReader, type Reader, type ReaderDiagnostics } from './reader.ts';
 import { ListeningState, type Snapshot, type Track } from './state.ts';
 import { NeteaseComments, trackKey, type ArtistProfile, type CommentProvider, type CommentReference } from './comments.ts';
 import { briefLyrics, currentIndex, lyricsLabel, type LyricsReference } from './lyrics.ts';
 import { INTERACTION_LABELS, INTERACTION_LEVELS, interactionFactor, profileSummary, PreferenceStore, type InteractionLevel } from './preferences.ts';
 import { ListeningMemoryStore, LISTENING_DWELL_MS, ReplayCounter } from './listening.ts';
 import { runControl, type ControlAction } from './control.ts';
+import { playerMatchText, readMprisPlayers } from './mpris.ts';
 import { sectionOf } from './phase.ts';
 import { searchAndPick } from './picker.ts';
 import { chooseFocus, type CommentFocus, type FocusInput, type FocusKey } from './focus.ts';
@@ -58,6 +59,23 @@ export const toolDecls: ReadonlyArray<Omit<ToolDef, 'handler'>> = [
 ];
 
 const execFileAsync = promisify(execFile);
+/** Linux 版连接检查：SPlayer 是否安装/运行，以及总线上全部 MPRIS 会话。结构与原 Windows 脚本输出一致。 */
+async function linuxConnectionStatus(): Promise<{ apps: unknown[]; sessions: unknown[]; error?: string }> {
+  const binary = ['/usr/bin/splayer', '/opt/SPlayer/splayer'].find(path => existsSync(path)) ?? '';
+  let running = false;
+  try { running = Boolean((await execFileAsync('pgrep', ['-x', '-i', 'splayer'], { timeout: 3000, encoding: 'utf8' })).stdout.trim()); } catch {}
+  const apps = [{ id: 'netease', name: 'SPlayer', installed: Boolean(binary), running, version: '', path: binary }];
+  try {
+    const players = await readMprisPlayers();
+    const sessions = players.map(item => ({
+      app: item.app, bus: item.bus, identity: item.identity, status: item.status, type: 'Music',
+      title: item.title, artist: item.artist,
+    }));
+    return { apps, sessions };
+  } catch (error) {
+    return { apps, sessions: [], error: error instanceof Error ? error.message : String(error) };
+  }
+}
 
 function cadenceHint(level: InteractionLevel | null): string {
   switch (level) {
@@ -127,7 +145,7 @@ export class MusicWorld implements World {
   private focusUsed = new Set<FocusKey>();
   constructor(private cfg: MusicConfig, private persist: (patch: Partial<MusicConfig>) => void, reader?: Reader,
     private comments: CommentProvider = new NeteaseComments(), preferencesDir = '') {
-    this.reader = reader ?? new WindowsReader(cfg);
+    this.reader = reader ?? new MprisReader(cfg);
     this.localDir = preferencesDir;
     if (preferencesDir) {
       const memory = () => this.memoryDir();
@@ -463,15 +481,10 @@ export class MusicWorld implements World {
       }),
     };
   }
-  /** 「连接检查」只读本机进程、卸载表与 SMTC 会话，不修改任何第三方配置。 */
+  /** 「连接检查」只读本机进程、安装位置与 MPRIS 会话，不修改任何第三方配置。 */
   private async connectionStatus(): Promise<unknown> {
     try {
-      const { stdout } = await execFileAsync('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive',
-        '-ExecutionPolicy', 'Bypass', '-File', fileURLToPath(new URL('../scripts/smtc-status.ps1', import.meta.url))],
-      { windowsHide: true, timeout: 15_000, maxBuffer: 512 * 1024, encoding: 'utf8' });
-      const text = stdout.trim();
-      if (!text) return { apps: [], sessions: [], error: '没有返回检测结果' };
-      const parsed = JSON.parse(text) as { apps?: unknown[]; sessions?: unknown[]; error?: unknown };
+      const parsed = await linuxConnectionStatus();
       // 官方播放器直接算支持；保存过的清单外播放器也算支持；其余会话在「通用识别」开启时参与，可被黑名单排除。
       const autoOn = this.cfg.autoDetect !== false;
       const blacklist = parseAutoBlacklist(this.cfg.autoBlacklist);
@@ -479,7 +492,7 @@ export class MusicWorld implements World {
       const sessions = (Array.isArray(parsed.sessions) ? parsed.sessions : []).map(item => {
         const session = (item && typeof item === 'object' ? item : {}) as Record<string, unknown>;
         const app = String(session.app ?? '');
-        const player = matchPlayer(app);
+        const player = matchPlayer(playerMatchText({ app, identity: String(session.identity ?? ''), desktopEntry: '', bus: String(session.bus ?? '') }));
         const isAuto = player === null;
         const saved = isAuto && savedIds.has(autoPlayerId(app));
         const kind = String(session.type ?? '');
@@ -619,8 +632,8 @@ export class MusicWorld implements World {
       // 顶部徽章不随运行状态刷新，已移除；状态统一由「实时状态」面板每 2 秒读取。
       panels: [
         { id: 'live-status', title: '实时状态', description: '每 2 秒刷新读取状态、当前曲目、评论区与歌手资料' },
-        { id: 'connection-check', title: '连接检查', description: '检测音乐软件安装、运行状态与 SMTC 会话，并给出开启指引' },
-        { id: 'reader-diagnostics', title: '读取诊断', description: '查看读取器命中的播放器、全部 SMTC 会话与窗口候选，并可单独重启读取器' },
+        { id: 'connection-check', title: '连接检查', description: '检测 SPlayer 安装、运行状态与 MPRIS 会话' },
+        { id: 'reader-diagnostics', title: '读取诊断', description: '查看读取器命中的播放器、全部 MPRIS 会话，并可单独重启读取器' },
         { id: 'listening-ranking', title: '听歌排名', description: '按播放次数排列的常听歌曲与歌手，数量随配置上限' },
         { id: 'profile-analysis', title: '个人画像', description: '按天汇总的听歌节奏、常听歌手、循环曲、播放器占比与口味画像' },
         { id: 'data-overview', title: '数据一览', description: '查看各数据文件的用途、大小与位置，可把本机记忆迁到当前目录，或从另一个文件夹合并/替换导入记忆' },
@@ -784,7 +797,6 @@ export class MusicWorld implements World {
           match: current?.app ?? '',
           player: current?.player ?? '',
           session: player?.session ?? '',
-          priority: playerEnv(this.cfg.playerPriority),
         });
         return JSON.stringify({ status: result.ok ? 'ok' : 'unavailable', action, ...result });
       }

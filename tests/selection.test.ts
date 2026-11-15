@@ -22,13 +22,17 @@ test('没有粘性时按优先级选择播放中的会话', () => {
 });
 
 test('当前播放器仍在播放时，高优先级播放器需要连续出现才切换', () => {
+  // Linux 版只有一个官方播放器（SPlayer），用已保存的播放器充当低优先级的另一方。
+  const order = ['netease', 'auto:bar'];
+  const opts = { enabled: false, blacklist: [] as string[], saved: ['auto:bar'] };
+  const bar = session('auto:bar', { app: 'bar' });
   const selector = new TrackSelector(2);
-  selector.select(priority, [session('qq')], []);
-  const first = selector.select(priority, [session('qq'), session('netease')], []);
-  assert.equal(first?.player, 'qq');
+  selector.select(order, [bar], [], opts);
+  const first = selector.select(order, [bar, session('netease')], [], opts);
+  assert.equal(first?.player, 'auto:bar');
   assert.equal(first?.reason, 'sticky');
   assert.equal(selector.state().pending?.player, 'netease');
-  const second = selector.select(priority, [session('qq'), session('netease')], []);
+  const second = selector.select(order, [bar, session('netease')], [], opts);
   assert.equal(second?.player, 'netease');
   assert.equal(second?.reason, 'priority-playing');
   assert.equal(selector.state().pending, undefined);
@@ -71,13 +75,13 @@ test('通用识别：只有未知会话时暂停也作为兜底，有官方会�
   const picked = new TrackSelector().select(priority, [paused], [], auto);
   assert.equal(picked?.player, 'auto:foo');
   assert.equal(picked?.reason, 'priority-paused');
-  const officialPaused = new TrackSelector().select(priority, [paused, session('qq', { status: 'paused' })], [], auto);
-  assert.equal(officialPaused?.player, 'qq');
+  const officialPaused = new TrackSelector().select(priority, [paused, session('netease', { status: 'paused' })], [], auto);
+  assert.equal(officialPaused?.player, 'netease');
 });
 
 test('通用识别：官方或已保存的播放器在播时未知播放器不接管', () => {
   const unknown = session(autoPlayerId('foo.exe'), { app: 'foo.exe' });
-  assert.equal(new TrackSelector().select(priority, [session('qq'), unknown], [], auto)?.player, 'qq');
+  assert.equal(new TrackSelector().select(priority, [session('netease'), unknown], [], auto)?.player, 'netease');
   const saved = { enabled: true, blacklist: [] as string[], saved: ['auto:bar'] };
   const savedPlaying = session('auto:bar', { app: 'bar.exe' });
   assert.equal(new TrackSelector().select(priority, [savedPlaying, unknown], [], saved)?.player, 'auto:bar');
@@ -86,11 +90,11 @@ test('通用识别：官方或已保存的播放器在播时未知播放器不�
 test('通用识别：保存后的未知播放器按已支持对待，暂停也参与并排在官方项之后', () => {
   const saved = { enabled: true, blacklist: [] as string[], saved: ['auto:foo'] };
   const foo = session('auto:foo', { app: 'foo.exe', status: 'paused' });
-  const official = session('qq', { status: 'paused' });
-  assert.equal(new TrackSelector().select(priority, [foo, official], [], saved)?.player, 'qq');
+  const official = session('netease', { status: 'paused' });
+  assert.equal(new TrackSelector().select(priority, [foo, official], [], saved)?.player, 'netease');
   assert.equal(new TrackSelector().select(priority, [foo], [], saved)?.player, 'auto:foo');
   // 保存项也不能压过正在播放的官方播放器。
-  assert.equal(new TrackSelector().select(priority, [foo, session('qq')], [], saved)?.player, 'qq');
+  assert.equal(new TrackSelector().select(priority, [foo, session('netease')], [], saved)?.player, 'netease');
 });
 
 test('通用识别：保存项按播放器优先级参与，可排在官方之前或之间', () => {
@@ -125,12 +129,12 @@ test('通用识别：黑名单关键词按完整片段匹配，不同发行版�
 });
 
 test('通用识别：播放中的未知播放器压过暂停的官方播放器，但压不过在播的官方播放器', () => {
-  const known = session('qq', { status: 'paused' });
+  const known = session('netease', { status: 'paused' });
   const unknown = session(autoPlayerId('foo.exe'), { app: 'foo.exe' });
   const viaPaused = new TrackSelector().select(priority, [known, unknown], [], auto);
   assert.equal(viaPaused?.player, 'auto:foo');
-  const viaPlaying = new TrackSelector().select(priority, [session('qq'), unknown], [], auto);
-  assert.equal(viaPlaying?.player, 'qq');
+  const viaPlaying = new TrackSelector().select(priority, [session('netease'), unknown], [], auto);
+  assert.equal(viaPlaying?.player, 'netease');
 });
 
 test('通用识别：黑名单里的应用不参与', () => {
@@ -182,31 +186,27 @@ test('没有 SMTC 会话时按优先级选择窗口标题，并保持窗口来�
   assert.equal(kept?.reason, 'window-sticky');
 });
 
-const fullPriority = ['netease', 'qq', 'kugou', 'kuwo', 'spotify', 'apple'];
+const fullPriority = ['netease', 'auto:bar'];
 const unknown = session(autoPlayerId('foo.exe'), { app: 'foo.exe' });
+const bar = session('auto:bar', { app: 'bar' });
 
-// 1.20.0 的通用识别不得改变官方清单原有的优先级、粘性与窗口兜底。
+// 通用识别不得改变官方（SPlayer）与已保存播放器原有的优先级、粘性与窗口兜底。
 for (const enabled of [false, true]) {
-  const autoOptions = { enabled, blacklist: [] as string[] };
-  test(`通用识别${enabled ? '开' : '关'}时六个官方播放器仍按优先级选择`, () => {
-    const all = fullPriority.map(player => session(player));
-    assert.equal(new TrackSelector().select(fullPriority, all, [], autoOptions)?.player, 'netease');
+  const autoOptions = { enabled, blacklist: [] as string[], saved: ['auto:bar'] };
+  test(`通用识别${enabled ? '开' : '关'}时官方与已保存播放器仍按优先级选择`, () => {
+    assert.equal(new TrackSelector().select(fullPriority, [bar, session('netease'), unknown], [], autoOptions)?.player, 'netease');
+    assert.equal(new TrackSelector().select(fullPriority, [bar, unknown], [], autoOptions)?.player, 'auto:bar');
     assert.equal(new TrackSelector().select(fullPriority,
-      [session('spotify'), session('kuwo'), unknown], [], autoOptions)?.player, 'kuwo');
-    assert.equal(new TrackSelector().select(fullPriority,
-      fullPriority.map(player => session(player, { status: 'paused' })), [], autoOptions)?.player, 'netease');
+      [{ ...bar, status: 'paused' }, session('netease', { status: 'paused' })], [], autoOptions)?.player, 'netease');
   });
 
-  test(`通用识别${enabled ? '开' : '关'}时官方切换粘性与窗口兜底不变`, () => {
+  test(`通用识别${enabled ? '开' : '关'}时切换粘性与窗口兜底不变`, () => {
     const selector = new TrackSelector(2);
-    selector.select(fullPriority, [session('qq')], [], autoOptions);
-    // 未知播放器在播不影响官方粘性。
-    assert.equal(selector.select(fullPriority, [session('qq'), session('netease'), unknown], [], autoOptions)?.player, 'qq');
-    assert.equal(selector.select(fullPriority, [session('qq'), session('netease'), unknown], [], autoOptions)?.player, 'netease');
-    const windows: WindowCandidate[] = [
-      { player: 'spotify', app: 'Spotify', title: '晴天 - 周杰伦' },
-      { player: 'netease', app: 'cloudmusic', title: '晴天 - 周杰伦' },
-    ];
+    selector.select(fullPriority, [bar], [], autoOptions);
+    // 未知播放器在播不影响粘性。
+    assert.equal(selector.select(fullPriority, [bar, session('netease'), unknown], [], autoOptions)?.player, 'auto:bar');
+    assert.equal(selector.select(fullPriority, [bar, session('netease'), unknown], [], autoOptions)?.player, 'netease');
+    const windows: WindowCandidate[] = [{ player: 'netease', app: 'splayer', title: '晴天 - 周杰伦' }];
     const fresh = new TrackSelector().select(fullPriority, [], windows, autoOptions);
     assert.equal(fresh?.player, 'netease');
     assert.equal(fresh?.track.method, 'window-title');

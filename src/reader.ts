@@ -1,9 +1,7 @@
-import { spawn, type ChildProcess } from 'node:child_process';
-import { createInterface } from 'node:readline';
-import { fileURLToPath } from 'node:url';
-import { customPlayerIds, isAutoPlayer, parseAutoBlacklist, parseCustomPlayers, playerEnv, playerOrder, type MusicConfig } from './config.ts';
+import { customPlayerIds, isAutoPlayer, matchPlayer, parseAutoBlacklist, parseCustomPlayers, playerOrder, type MusicConfig } from './config.ts';
+import { busctl, playerMatchText, readMprisPlayers, type BusRunner, type MprisPlayer } from './mpris.ts';
 import { TrackSelector, type Selection, type SelectorState } from './selection.ts';
-import { parseCandidates, parseSnapshot, type MediaCandidates, type SessionCandidate, type Snapshot, type WindowCandidate } from './state.ts';
+import { parseCandidates, type MediaCandidates, type SessionCandidate, type Snapshot, type WindowCandidate } from './state.ts';
 
 export interface ReaderDiagnostics {
   running: boolean;
@@ -20,11 +18,33 @@ export interface Reader {
   stop(): Promise<void>;
   diagnostics?(): ReaderDiagnostics;
 }
-export class WindowsReader implements Reader {
-  private child?: ChildProcess;
-  private stopping = false;
-  private restart?: ReturnType<typeof setTimeout>;
-  private watchdog?: ReturnType<typeof setInterval>;
+/** MPRIS 播放器 → 选择器使用的会话候选；官方播放器给官方 id，其余标 auto 交给 parseCandidates 折算。 */
+export function mprisCandidates(players: MprisPlayer[], savedApps: readonly string[] = []): Record<string, unknown> {
+  const saved = new Set(savedApps.map(app => app.toLowerCase()));
+  // 保存过的清单外播放器排在前面，避免会话数超过上限时被挤掉。
+  const ordered = [...players].sort((a, b) => Number(saved.has(b.app.toLowerCase())) - Number(saved.has(a.app.toLowerCase())));
+  const seen = new Set<string>();
+  const sessions: Record<string, unknown>[] = [];
+  for (const player of ordered) {
+    if (!player.title || seen.has(player.app)) continue;
+    seen.add(player.app);
+    const official = matchPlayer(playerMatchText(player));
+    const status = player.status === 'Playing' ? 'playing' : player.status === 'Paused' || player.status === 'Stopped' ? 'paused' : 'unknown';
+    sessions.push({
+      app: player.app, player: official?.id ?? '', ...(official ? {} : { auto: true }), status,
+      title: player.title, artist: player.artist, album: player.album,
+      timeline: (player.positionSeconds ?? 0) > 0 || (player.durationSeconds ?? 0) > 0,
+      ...(player.positionSeconds !== undefined ? { positionSeconds: player.positionSeconds } : {}),
+      ...(player.durationSeconds !== undefined ? { durationSeconds: player.durationSeconds } : {}),
+    });
+  }
+  return { sessions, windowCandidates: [], error: '' };
+}
+
+/** Linux 版读取器：每两秒通过 busctl 轮询一次 MPRIS，选择逻辑与原 Windows 版共用。 */
+export class MprisReader implements Reader {
+  private stopping = true;
+  private timer?: ReturnType<typeof setTimeout>;
   private generation = 0;
   private failures = 0;
   private selector = new TrackSelector();
@@ -34,93 +54,56 @@ export class WindowsReader implements Reader {
   private latestSelection: Selection | null = null;
   private latestInvalid: string[] = [];
   private latestError = '';
-  constructor(private cfg: MusicConfig, private launchProcess: typeof spawn = spawn,
-    private timing = { heartbeatMs: 20_000, checkMs: 5000, retryMs: 2000 }) {}
+  private inflight?: Promise<void>;
+  constructor(private cfg: MusicConfig, private bus: BusRunner = busctl,
+    private timing = { pollMs: 2000, retryMs: 2000 }) {}
   start(onSnapshot: (s: Snapshot) => void, onError: (message: string) => void): void {
-    if (this.child || this.restart || this.watchdog) return;
+    if (!this.stopping) return;
     this.stopping = false;
     this.selector.reset();
     const generation = ++this.generation;
-    const launch = () => {
-      this.restart = undefined;
+    this.running = true;
+    const tick = async () => {
+      this.timer = undefined;
       if (this.stopping || generation !== this.generation) return;
-      let lastSnapshot = Date.now();
-      const child = this.child = this.launchProcess('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive',
-        '-ExecutionPolicy', 'Bypass', '-File', fileURLToPath(new URL('../scripts/media-session.ps1', import.meta.url))], {
-        windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
-        env: { ...process.env, MUSIC_PLAYER_ORDER: playerEnv(this.cfg.playerPriority),
-          MUSIC_WINDOW_FALLBACK: this.cfg.windowFallback ? '1' : '0',
-          // 会话始终全量上报，开关只决定未知播放器是否参与；这样读取诊断与连接检查不受开关影响。
-          MUSIC_AUTO_DETECT: '1',
-          // 保存过的清单外播放器优先上报，避免会话数量超过脚本上限时被挤掉。
-          MUSIC_SAVED_APPS: parseCustomPlayers(this.cfg.customPlayers).join(';') },
-      });
-      this.running = true;
-      let lineBytes = 0;
-      child.stdout!.on('data', (chunk: Buffer) => {
-        for (const byte of chunk) {
-          lineBytes = byte === 10 ? 0 : lineBytes + 1;
-          if (lineBytes > 65_536) { onError('媒体读取器数据过大，正在重连'); child.kill(); child.stdout!.destroy(); break; }
-        }
-      });
-      const lines = createInterface({ input: child.stdout! });
-      lines.on('line', line => {
-        if (this.stopping || generation !== this.generation || this.child !== child) return;
-        if (line.length > 32_768) { onError('媒体读取器数据过大，正在重连'); child.kill(); return; }
-        try {
-          const raw = JSON.parse(line) as Record<string, unknown>;
-          lastSnapshot = Date.now();
-          this.failures = 0;
-          this.updatedAt = Date.now();
-          if (Array.isArray(raw.sessions) || Array.isArray(raw.windowCandidates)) {
-            const candidates = parseCandidates(raw);
-            this.latest = candidates;
-            this.latestError = candidates.error ?? '';
-            const saved = customPlayerIds(this.cfg.customPlayers);
-            // 保存项的顺序跟设置里的播放器优先级走，不再固定排在官方之后。
-            const allowed = new Set([...playerOrder(this.cfg.playerPriority, saved), ...saved]);
-            const autoOn = this.cfg.autoDetect !== false;
-            // auto:<短名> 是通用识别的正常标识，参与与否由开关和保存项决定，不算「无法识别」。
-            this.latestInvalid = [...new Set(
-              [...candidates.sessions, ...candidates.windows].map(item => item.player)
-                .filter(id => !isAutoPlayer(id) && !allowed.has(id)),
-            )];
-            this.latestSelection = this.selector.select(this.cfg.playerPriority, candidates.sessions, candidates.windows, {
-              enabled: autoOn, blacklist: parseAutoBlacklist(this.cfg.autoBlacklist), saved,
-            });
-            onSnapshot({ track: this.latestSelection?.track ?? null, error: candidates.error });
-          } else {
-            this.latest = { sessions: [], windows: [] };
-            this.latestSelection = null;
-            this.latestInvalid = [];
-            this.latestError = '';
-            onSnapshot(parseSnapshot(raw));
-          }
-        } catch { onError('媒体读取器返回了无法识别的数据'); }
-      });
-      this.watchdog = setInterval(() => {
-        if (Date.now() - lastSnapshot > this.timing.heartbeatMs) { onError('媒体读取超时无响应，正在重连'); child.kill(); }
-      }, this.timing.checkMs);
-      child.stderr?.on('data', () => { if (generation === this.generation && !this.stopping) onError('媒体读取器报告错误，请运行 npm run diagnose 查看本机输出'); });
-      child.on('error', e => { if (!this.stopping && generation === this.generation) onError(e.message); });
-      child.on('close', () => {
-        lines.close();
-        if (this.child !== child || generation !== this.generation) return;
+      let delay = this.timing.pollMs;
+      try {
+        const players = await readMprisPlayers(this.bus);
+        if (this.stopping || generation !== this.generation) return;
+        this.failures = 0;
+        this.running = true;
+        this.handle(mprisCandidates(players, parseCustomPlayers(this.cfg.customPlayers)), onSnapshot);
+      } catch (error) {
+        if (this.stopping || generation !== this.generation) return;
+        delay = Math.min(60_000, this.timing.retryMs * 2 ** Math.min(this.failures++, 5));
         this.running = false;
         this.latest = { sessions: [], windows: [] };
         this.latestSelection = null;
-        this.latestInvalid = [];
-        clearInterval(this.watchdog);
-        this.watchdog = undefined;
-        this.child = undefined;
-        if (!this.stopping) {
-          const delay = Math.min(60_000, this.timing.retryMs * 2 ** Math.min(this.failures++, 5));
-          onError(`媒体读取器退出，${delay / 1000} 秒后重试`);
-          this.restart = setTimeout(launch, delay);
-        }
-      });
+        this.latestError = error instanceof Error ? error.message : String(error);
+        onError(`读取 MPRIS 失败（${this.latestError}），${delay / 1000} 秒后重试`);
+      }
+      if (!this.stopping && generation === this.generation) this.timer = setTimeout(() => { this.inflight = tick(); }, delay);
     };
-    launch();
+    this.inflight = tick();
+  }
+  private handle(raw: Record<string, unknown>, onSnapshot: (s: Snapshot) => void): void {
+    this.updatedAt = Date.now();
+    const candidates = parseCandidates(raw);
+    this.latest = candidates;
+    this.latestError = candidates.error ?? '';
+    const saved = customPlayerIds(this.cfg.customPlayers);
+    // 保存项的顺序跟设置里的播放器优先级走，不再固定排在官方之后。
+    const allowed = new Set([...playerOrder(this.cfg.playerPriority, saved), ...saved]);
+    const autoOn = this.cfg.autoDetect !== false;
+    // auto:<短名> 是通用识别的正常标识，参与与否由开关和保存项决定，不算「无法识别」。
+    this.latestInvalid = [...new Set(
+      [...candidates.sessions, ...candidates.windows].map(item => item.player)
+        .filter(id => !isAutoPlayer(id) && !allowed.has(id)),
+    )];
+    this.latestSelection = this.selector.select(this.cfg.playerPriority, candidates.sessions, candidates.windows, {
+      enabled: autoOn, blacklist: parseAutoBlacklist(this.cfg.autoBlacklist), saved,
+    });
+    onSnapshot({ track: this.latestSelection?.track ?? null, error: candidates.error });
   }
   diagnostics(): ReaderDiagnostics {
     return {
@@ -141,17 +124,8 @@ export class WindowsReader implements Reader {
     this.latestSelection = null;
     this.latestInvalid = [];
     ++this.generation;
-    clearTimeout(this.restart);
-    this.restart = undefined;
-    clearInterval(this.watchdog);
-    this.watchdog = undefined;
-    const child = this.child;
-    if (!child || child.exitCode !== null) return;
-    await new Promise<void>(resolve => {
-      const timeout = setTimeout(resolve, 2000);
-      child.once('close', () => { clearTimeout(timeout); resolve(); });
-      child.kill();
-    });
-    this.child = undefined;
+    clearTimeout(this.timer);
+    this.timer = undefined;
+    await this.inflight?.catch(() => {});
   }
 }

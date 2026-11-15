@@ -1,19 +1,15 @@
-import { execFile } from 'node:child_process';
-import { existsSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
+import { matchPlayer } from './config.ts';
+import { busctl, callMpris, playerMatchText, readMprisPlayer, readMprisPlayers, type BusRunner, type MprisMethod, type MprisPlayer } from './mpris.ts';
 
-export const CONTROL_SCRIPT = fileURLToPath(new URL('../scripts/control.ps1', import.meta.url));
 export type ControlAction = 'pause' | 'resume' | 'next' | 'prev';
 
 export interface ControlOptions {
-  /** 当前曲目的 SMTC 应用 ID，作为最后兜底。 */
+  /** 当前曲目的 MPRIS 应用名，作为最后兜底。 */
   match?: string;
   /** 当前播放器 id，便于回执标明来源。 */
   player?: string;
-  /** 当前播放器的 SMTC 应用名正则；优先控制这个播放器。 */
+  /** 当前播放器的应用名正则；优先控制这个播放器。 */
   session?: string;
-  /** 官方播放器优先级 JSON，当前播放器没有会话时按它选择。 */
-  priority?: string;
 }
 export interface ControlResult {
   ok: boolean;
@@ -25,30 +21,41 @@ export interface ControlResult {
   error?: string;
 }
 
-/** 一次性调用播放器的 SMTC 控制接口；失败以结果返回，不抛出。 */
-export function runControl(action: ControlAction, options: ControlOptions = {}, timeoutMs = 10_000): Promise<ControlResult> {
-  return new Promise(resolve => {
-    if (!existsSync(CONTROL_SCRIPT)) return resolve({ ok: false, error: '控制脚本不存在' });
-    execFile(
-      'powershell.exe',
-      ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
-        '-File', CONTROL_SCRIPT, '-Action', action,
-        ...(options.match ? ['-Match', options.match] : []),
-        ...(options.player ? ['-Player', options.player] : []),
-        ...(options.session ? ['-Session', options.session] : []),
-        ...(options.priority ? ['-Priority', options.priority] : [])],
-      { timeout: timeoutMs, windowsHide: true, encoding: 'utf8' },
-      (error, stdout) => {
-        if (error && !stdout) return resolve({ ok: false, error: error.message.slice(0, 200) });
-        const line = String(stdout).split(/\r?\n/).map(value => value.trim()).filter(value => value.startsWith('{')).pop();
-        if (!line) return resolve({ ok: false, error: '播放器没有回应' });
-        try {
-          const parsed = JSON.parse(line) as ControlResult;
-          return resolve({ ...parsed, ok: parsed.ok === true });
-        } catch {
-          return resolve({ ok: false, error: '播放器的回应读不懂' });
-        }
-      },
-    );
-  });
+const METHODS: Record<ControlAction, MprisMethod> = { pause: 'Pause', resume: 'Play', next: 'Next', prev: 'Previous' };
+const playingFirst = (list: MprisPlayer[]) => list.find(item => item.status === 'Playing') ?? list[0];
+
+/** 选出要控制的 MPRIS 播放器：当前播放器 > 同名应用 > 任一官方播放器。 */
+export function pickControlTarget(players: MprisPlayer[], options: ControlOptions): { target?: MprisPlayer; player: string; error?: string } {
+  if (options.session) {
+    let regex: RegExp;
+    try { regex = new RegExp(options.session, 'i'); } catch { return { player: '', error: 'Invalid session regex' }; }
+    const current = players.filter(item => regex.test(playerMatchText(item)));
+    if (!current.length) return { player: '', error: 'Current player has no controllable media session' };
+    return { target: playingFirst(current), player: options.player || 'current' };
+  }
+  if (options.match) {
+    const same = players.filter(item => item.app === options.match);
+    if (same.length) return { target: playingFirst(same), player: options.player || 'current' };
+  }
+  const official = players.filter(item => matchPlayer(playerMatchText(item)) !== null);
+  if (official.length) {
+    const target = playingFirst(official);
+    return { target, player: matchPlayer(playerMatchText(target))!.id };
+  }
+  return { player: '', error: players.length ? 'No official player session' : 'No controllable media session' };
+}
+
+/** 通过 MPRIS 暂停/继续/切歌；失败以结果返回，不抛出。 */
+export async function runControl(action: ControlAction, options: ControlOptions = {}, run: BusRunner = busctl,
+  settleMs = 400): Promise<ControlResult> {
+  try {
+    const { target, player, error } = pickControlTarget(await readMprisPlayers(run), options);
+    if (!target) return { ok: false, player, error };
+    await callMpris(target.bus, METHODS[action], run);
+    if (settleMs > 0) await new Promise(resolve => setTimeout(resolve, settleMs));
+    const after = await readMprisPlayer(target.bus, run).catch(() => target);
+    return { ok: true, app: after.app, player, status: after.status, title: after.title, artist: after.artist };
+  } catch (error) {
+    return { ok: false, error: (error instanceof Error ? error.message : String(error)).slice(0, 200) };
+  }
 }

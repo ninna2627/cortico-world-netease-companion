@@ -86,11 +86,11 @@ test('webUi 提供实时状态面板与快照', async () => {
   const reader = settings.groups.find((group: any) => group.kind === 'reader');
   assert.ok(reader.fields.every((field: any) => field.hot === false));
   assert.deepEqual(reader.fields.map((field: any) => field.key), ['playerPriority', 'windowFallback', 'autoDetect', 'autoBlacklist']);
-  assert.deepEqual(reader.players.map((player: any) => player.id), ['netease', 'qq', 'kugou', 'kuwo', 'spotify', 'apple']);
-  assert.equal(reader.fields[0].value.join(','), 'netease,qq,kugou,kuwo,spotify,apple');
+  assert.deepEqual(reader.players.map((player: any) => player.id), ['netease']);
+  assert.equal(reader.fields[0].value.join(','), 'netease');
   const diagnostics = await web.invoke!('reader-diagnostics', 'snapshot', []) as any;
   assert.equal(diagnostics.status, 'ok');
-  assert.deepEqual(diagnostics.priority.map((item: any) => item.id), ['netease', 'qq', 'kugou', 'kuwo', 'spotify', 'apple']);
+  assert.deepEqual(diagnostics.priority.map((item: any) => item.id), ['netease']);
   assert.equal(diagnostics.current, null);
   assert.equal(diagnostics.reader.running, false);
   assert.deepEqual(diagnostics.reader.sessions, []);
@@ -110,7 +110,7 @@ test('设置面板直接持久化配置并校验范围', async () => {
     cooldownSeconds: 45, lyricsLines: 20.9, windowFallback: false,
     announceTracks: false, segmentComments: true, segmentCount: 3, segmentEverySeconds: 0,
     actionHints: false, allowPlaybackControl: true, stateComments: false,
-    playerPriority: ['spotify', 'netease', 'spotify', 'unknown'], unknown: 1,
+    playerPriority: ['unknown', 'netease', 'netease'], unknown: 1,
   }]);
   assert.equal(cfg.cooldownSeconds, 45);
   assert.equal(cfg.lyricsLines, 20);
@@ -122,7 +122,7 @@ test('设置面板直接持久化配置并校验范围', async () => {
   assert.equal(cfg.actionHints, false);
   assert.equal(cfg.allowPlaybackControl, true);
   assert.equal(cfg.stateComments, false);
-  assert.deepEqual(cfg.playerPriority, ['spotify', 'netease', 'qq', 'kugou', 'kuwo', 'apple']);
+  assert.deepEqual(cfg.playerPriority, ['netease']);
   assert.equal((cfg as any).unknown, undefined);
   await assert.rejects(web.invoke!('settings', 'save', [{ cooldownSeconds: 5 }]), /不能小于/);
   await assert.rejects(web.invoke!('settings', 'save', [{ playerPriority: 'netease' }]), /不是有效列表/);
@@ -371,21 +371,19 @@ test('解析读取候选并过滤无效项', () => {
 });
 
 test('官方播放器清单、优先级归一化与匹配', () => {
-  assert.deepEqual(PLAYERS.map(player => player.id), ['netease', 'qq', 'kugou', 'kuwo', 'spotify', 'apple']);
-  assert.deepEqual(playerOrder(undefined), ['netease', 'qq', 'kugou', 'kuwo', 'spotify', 'apple']);
-  assert.deepEqual(playerOrder(['spotify', 'qq', 'spotify', 'unknown']), ['spotify', 'qq', 'netease', 'kugou', 'kuwo', 'apple']);
+  // Linux 个人版：唯一的官方播放器是 SPlayer，内部 id 沿用 netease。
+  assert.deepEqual(PLAYERS.map(player => player.id), ['netease']);
+  assert.deepEqual(playerOrder(undefined), ['netease']);
+  assert.deepEqual(playerOrder(['qq', 'netease', 'netease', 'unknown']), ['netease']);
   // 已保存的播放器进入优先级：保留用户排的位置，旧配置缺项补末尾，删除后不留残项。
   const custom = 'auto:vutronmusic';
-  assert.deepEqual(playerOrder(['netease', custom, 'qq'], [custom]),
-    ['netease', custom, 'qq', 'kugou', 'kuwo', 'spotify', 'apple']);
-  assert.deepEqual(playerOrder(['netease', 'qq'], [custom]),
-    ['netease', 'qq', 'kugou', 'kuwo', 'spotify', 'apple', custom]);
-  assert.deepEqual(playerOrder([custom, 'netease', 'qq'], []),
-    ['netease', 'qq', 'kugou', 'kuwo', 'spotify', 'apple']);
-  assert.equal(matchPlayer('Spotify.exe')?.id, 'spotify');
-  assert.equal(matchPlayer('SpotifyAB.SpotifyMusic_zpdnekdrzrea0!Spotify')?.id, 'spotify');
-  assert.equal(matchPlayer('AppleInc.AppleMusicWin_nzyj5cx40ttqa!App')?.id, 'apple');
-  assert.equal(matchPlayer('AppleMusic.exe')?.id, 'apple');
+  assert.deepEqual(playerOrder([custom, 'netease'], [custom]), [custom, 'netease']);
+  assert.deepEqual(playerOrder(['netease'], [custom]), ['netease', custom]);
+  assert.deepEqual(playerOrder([custom, 'netease'], []), ['netease']);
+  // 按 MPRIS 应用名 / Identity / 总线名匹配。
+  assert.equal(matchPlayer('SPlayer')?.id, 'netease');
+  assert.equal(matchPlayer('org.mpris.MediaPlayer2.splayer.instance17268')?.id, 'netease');
+  assert.equal(matchPlayer('firefox Mozilla firefox')?.id, undefined);
   // 通用识别：清单外的应用折算成 auto:<短名>，展示名取 exe 名或 MSIX 包名。
   assert.equal(autoPlayerId('VutronMusic.exe'), 'auto:vutronmusic');
   assert.equal(autoPlayerId('foo.bar.exe'), 'auto:foo-bar');
@@ -394,8 +392,7 @@ test('官方播放器清单、优先级归一化与匹配', () => {
   assert.equal(autoLabel('VutronMusic.exe'), 'VutronMusic');
   assert.equal(autoLabel('Microsoft.ZuneMusic_8wekyb3d8bbwe!Microsoft.ZuneMusic'), 'Microsoft.ZuneMusic');
   // 国际曲库标记不再靠枚举播放器 id。
-  assert.equal(isInternationalPlayer('spotify'), true);
-  assert.equal(isInternationalPlayer('apple'), true);
+  assert.equal(isInternationalPlayer('spotify'), false);
   assert.equal(isInternationalPlayer('netease'), false);
   assert.equal(isInternationalPlayer('auto:foo'), false);
   assert.deepEqual(parseAutoBlacklist(' Foo.exe, auto:bar\nbaz；qux '), ['foo.exe', 'auto:bar', 'baz', 'qux']);
@@ -421,9 +418,7 @@ test('官方播放器清单、优先级归一化与匹配', () => {
   // 保存的播放器去重、保序，并折算成 auto:<短名>。
   assert.deepEqual(parseCustomPlayers(['foo.exe', ' FOO.exe ', '', null, 'bar.exe']), ['foo.exe', 'bar.exe']);
   assert.deepEqual(customPlayerIds(['foo.exe', 'bar.exe']), ['auto:foo', 'auto:bar']);
-  assert.equal(matchPlayer('KuGou.exe')?.id, 'kugou');
-  assert.equal(matchPlayer('KwMusic.exe')?.id, 'kuwo');
-  assert.equal(matchPlayer('QQMusic.exe')?.id, 'qq');
+  assert.equal(matchPlayer('QQMusic.exe'), null);
   assert.equal(matchPlayer('chrome.exe'), null);
 });
 
@@ -441,7 +436,7 @@ test('连接检查保存/取消保存未知播放器并解除同名黑名单', (
   assert.deepEqual(cfg.customPlayers, []);
   // 取消保存只清支持列表与优先级，不写黑名单。
   assert.ok(!cfg.playerPriority.includes('auto:vutronmusic'));
-  assert.equal(cfg.playerPriority.length, 6);
+  assert.equal(cfg.playerPriority.length, 1);
   assert.equal(cfg.autoBlacklist, 'msteams, teams');
   // 回到普通未知播放器：没有已知项在播时，按通用识别照常参与。
   assert.equal(new TrackSelector().select(cfg.playerPriority, [{
@@ -460,13 +455,13 @@ test('设置里的播放器优先级包含已保存项，调整顺序后实际�
   const cfg = {
     ...defaults(),
     customPlayers: ['VutronMusic.exe'],
-    playerPriority: ['netease', 'qq', 'kugou', 'kuwo', 'spotify', 'apple', id],
+    playerPriority: ['netease', id],
   };
   const world = new MusicWorld(cfg, patch => Object.assign(cfg, patch));
   const web = world.webUi();
   const settings = await web.invoke!('settings', 'read', []) as any;
   const reader = settings.groups.find((group: any) => group.kind === 'reader');
-  assert.deepEqual(reader.players.map((player: any) => player.id), ['netease', 'qq', 'kugou', 'kuwo', 'spotify', 'apple', id]);
+  assert.deepEqual(reader.players.map((player: any) => player.id), ['netease', id]);
   assert.equal(reader.players.at(-1).custom, true);
   assert.equal(reader.players.at(-1).app, 'VutronMusic.exe');
   // 通用识别默认关闭；缺字段的旧配置由 preflight 补成关闭。
@@ -474,19 +469,19 @@ test('设置里的播放器优先级包含已保存项，调整顺序后实际�
 
   const sessions = [
     { app: 'VutronMusic.exe', player: id, status: 'playing' as const, title: '晴天', artist: '', album: '', timeline: false },
-    { app: 'cloudmusic.exe', player: 'netease', status: 'playing' as const, title: '晴天', artist: '', album: '', timeline: false },
+    { app: 'SPlayer', player: 'netease', status: 'playing' as const, title: '晴天', artist: '', album: '', timeline: false },
   ];
   const pick = () => new TrackSelector().select(cfg.playerPriority, sessions, [], {
     enabled: true, blacklist: [], saved: customPlayerIds(cfg.customPlayers),
   })?.player;
   assert.equal(pick(), 'netease');
   // 把保存项拖到最前，选择结果立即跟着变。
-  await web.invoke!('settings', 'save', [{ playerPriority: [id, 'netease', 'qq', 'kugou', 'kuwo', 'spotify', 'apple'] }]);
+  await web.invoke!('settings', 'save', [{ playerPriority: [id, 'netease'] }]);
   assert.equal(cfg.playerPriority[0], id);
   assert.equal(pick(), id);
   // 官方项仍然一个不少，只调整相对顺序。
   await web.invoke!('settings', 'save', [{ playerPriority: ['qq'] }]);
-  assert.deepEqual(cfg.playerPriority, ['qq', 'netease', 'kugou', 'kuwo', 'spotify', 'apple', id]);
+  assert.deepEqual(cfg.playerPriority, ['netease', id]);
 });
 
 test('连接检查：保存项持久化、去重，最多 20 个', () => {

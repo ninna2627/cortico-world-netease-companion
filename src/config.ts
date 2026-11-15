@@ -7,7 +7,7 @@ export interface MusicConfig {
   cooldownSeconds: number;
   playerPriority: string[];
   windowFallback: boolean;
-  /** 通用识别：SMTC 里有会话、但不在官方清单里的播放器也参与陪听。 */
+  /** 通用识别：MPRIS 上有会话、但不在官方清单里的播放器也参与陪听。 */
   autoDetect: boolean;
   /** 通用识别的黑名单；换行或逗号分隔，可填应用 ID 或 auto: 后面的名字。 */
   autoBlacklist: string;
@@ -47,9 +47,9 @@ export interface PlayerDef {
   id: string;
   label: string;
   labelEn: string;
-  /** 匹配 Windows SMTC 的 SourceAppUserModelId。 */
+  /** 匹配 MPRIS 应用名 / Identity / DesktopEntry / 总线名的正则。 */
   session: string;
-  /** 窗口标题降级时匹配的进程名。 */
+  /** 窗口标题降级时匹配的进程名（Linux 版不使用）。 */
   window: string;
   /** 播放器是否提供播放位置与时长；没有时分段陪听只能按已播放时间估算。 */
   timeline: boolean;
@@ -58,27 +58,15 @@ export interface PlayerDef {
   note: string;
   noteEn: string;
 }
-/** 官方支持的音乐软件；顺序即默认读取优先级，也是设置页唯一允许的条目集合。 */
+/**
+ * 官方支持的音乐软件（Linux 个人版：只适配本机的 SPlayer）；顺序即默认读取优先级。
+ * id 沿用 netease：SPlayer 播放的是网易云曲库，评论、百科与歌词按网易云直接匹配。
+ */
 export const PLAYERS: readonly PlayerDef[] = [
-  { id: 'netease', label: '网易云音乐', labelEn: 'NetEase Cloud Music', session: 'cloudmusic|netease',
-    window: 'cloudmusic|netease', timeline: true,
-    note: 'SMTC 提供曲目、状态与播放进度；网易云数据匹配最好。',
-    noteEn: 'SMTC exposes track, state and progress; NetEase data matches best.' },
-  { id: 'qq', label: 'QQ 音乐', labelEn: 'QQ Music', session: 'qqmusic', window: 'qqmusic', timeline: true,
-    note: '较新版本提供完整 SMTC；需在「设置 → 常规设置 → 通知」开启「显示系统媒体传输控件（SMTC）」后重启客户端。',
-    noteEn: 'Recent versions expose full SMTC; enable system media controls in Settings → General → Notifications and restart the client.' },
-  { id: 'kugou', label: '酷狗音乐', labelEn: 'Kugou Music', session: 'kugou', window: 'kugou', timeline: false,
-    note: '提供 SMTC，但通常没有播放进度与时长；分段陪听按已播放时间估算，暂停时计时可能偏差。',
-    noteEn: 'Exposes SMTC but usually no position or duration; segments fall back to elapsed wall time and may drift while paused.' },
-  { id: 'kuwo', label: '酷我音乐', labelEn: 'Kuwo Music', session: 'kuwo|kwmusic', window: 'kwmusic|kuwo', timeline: false,
-    note: '媒体会话不稳定，通常退回窗口标题读取，只能取「歌名 - 歌手」；无法确认暂停与播放进度。',
-    noteEn: 'Media sessions are unreliable, so it usually falls back to the window title, which only yields "title - artist" and cannot confirm pause or progress.' },
-  { id: 'spotify', label: 'Spotify', labelEn: 'Spotify', session: 'spotify', window: 'spotify', timeline: true, international: true,
-    note: '通常提供完整 SMTC；评论与歌词仍按中文曲库匹配，未匹配时只做普通陪听。',
-    noteEn: 'Usually exposes full SMTC; comments and lyrics still match Chinese catalogues and fall back to plain companionship when unmatched.' },
-  { id: 'apple', label: 'Apple Music', labelEn: 'Apple Music', session: 'applemusic', window: 'applemusic', timeline: true, international: true,
-    note: 'Microsoft Store 版播放时提供 SMTC 曲目、状态与播放进度；曲库与网易云匹配较差，匹配不到时只做普通陪听。',
-    noteEn: 'The Microsoft Store build exposes track, state and progress over SMTC; its catalogue matches NetEase poorly, so unmatched tracks fall back to plain companionship.' },
+  { id: 'netease', label: 'SPlayer（网易云）', labelEn: 'SPlayer (NetEase)', session: 'splayer',
+    window: '', timeline: true,
+    note: '通过 MPRIS 提供曲目、状态与播放进度；曲库就是网易云，评论与歌词匹配最好。',
+    noteEn: 'Exposes track, state and progress over MPRIS; it plays the NetEase catalogue, so comments and lyrics match best.' },
 ];
 const PLAYER_IDS = new Set(PLAYERS.map(player => player.id));
 /** 官方播放器 + 已保存播放器的有效顺序：去重、保留用户顺序，缺失项补到末尾。 */
@@ -96,7 +84,7 @@ export function playerOrder(value: unknown, saved: readonly string[] = []): stri
   for (const id of custom) if (!seen.has(id)) { seen.add(id); ordered.push(id); }
   return ordered;
 }
-/** 把 SMTC 应用名解析成官方播放器；不认识的应用返回 null。 */
+/** 把 MPRIS 应用名解析成官方播放器；不认识的应用返回 null。 */
 export function matchPlayer(appId: string): PlayerDef | null {
   const value = String(appId ?? '');
   for (const player of PLAYERS) if (new RegExp(player.session, 'i').test(value)) return player;
@@ -176,13 +164,6 @@ export function customPlayerIds(value: unknown): string[] {
 export function isInternationalPlayer(id: string | undefined): boolean {
   return PLAYERS.some(player => player.id === id && player.international === true);
 }
-/** 读取脚本的环境变量：只把官方播放器按顺序交给 PowerShell。 */
-export function playerEnv(priority: string[]): string {
-  return JSON.stringify(playerOrder(priority).filter(id => PLAYER_IDS.has(id)).map(id => {
-    const player = PLAYERS.find(item => item.id === id)!;
-    return { id: player.id, session: player.session, window: player.window };
-  }));
-}
 export const defaults = (): MusicConfig => ({
   enabled: false, commentary: true, settleSeconds: 8, cooldownSeconds: 120,
   playerPriority: PLAYERS.map(player => player.id), windowFallback: true, autoDetect: false,
@@ -233,7 +214,7 @@ export const configGroups: ConfigGroup[] = [
       properties: {
         'worlds.netease-music.commentary': { type: 'boolean', title: '允许切歌评论', 'x-hot': true },
         'worlds.netease-music.announceTracks': { type: 'boolean', title: '切歌报幕', description: '新歌稳定后先用半句自然报出歌名/歌手，再说感受；信息缺失或不确定时不硬报。', 'x-hot': true },
-        'worlds.netease-music.segmentComments': { type: 'boolean', title: '同曲分段陪听', description: '同一首歌按设置的次数追加短评；有 SMTC 位置时按播放比例，没有位置时按间隔估算，仍受评论间隔与安静开关约束。默认关闭。', 'x-hot': true },
+        'worlds.netease-music.segmentComments': { type: 'boolean', title: '同曲分段陪听', description: '同一首歌按设置的次数追加短评；有 MPRIS 播放位置时按播放比例，没有位置时按间隔估算，仍受评论间隔与安静开关约束。默认关闭。', 'x-hot': true },
         'worlds.netease-music.segmentCount': { type: 'integer', title: '每首分段次数', description: '1–4，默认 2。每首最多追加几次分段短评；次数越多越容易变成刷屏。', minimum: 1, maximum: 4, 'x-hot': true },
         'worlds.netease-music.segmentEverySeconds': { type: 'integer', title: '无播放位置时的分段间隔（秒）', description: '0–300，默认 60。播放器不提供播放位置或时长时，按已播放时间每 N 秒检查一次分段；0 = 只按位置分段。', minimum: 0, maximum: 300, 'x-hot': true },
         'worlds.netease-music.actionHints': { type: 'boolean', title: '动作/表情提示', description: '按歌曲情绪提示桌宠使用形象已有的动作/表情；只使用当前形象支持的词，不会新增动作。', 'x-hot': true },
@@ -296,8 +277,8 @@ export const configGroups: ConfigGroup[] = [
       type: 'object', title: '媒体读取', description: '官方播放器按优先级读取；开启通用识别（默认关闭）后，其他向系统媒体控件上报会话的播放器也能参与陪听。修改后需重启 World。',
       properties: {
         'worlds.netease-music.playerPriority': { type: 'array', title: '播放器优先级（重启生效）', description: '官方支持的音乐软件与已保存的软件，用拖动或上移/下移调整顺序，靠前的优先读取；官方项不能删除，已保存的软件可到「连接检查」取消保存。新保存的软件会先追加到末尾，之后按这里的顺序生效。修改后重启 World。', 'x-hot': false },
-        'worlds.netease-music.windowFallback': { type: 'boolean', title: '启用窗口标题降级（重启生效）', description: 'SMTC 不可用时读取官方播放器窗口标题里的「歌名 - 歌手」；无法确认暂停与播放进度，也不会匹配其他软件。', 'x-hot': false },
-        'worlds.netease-music.autoDetect': { type: 'boolean', title: '通用识别（重启生效）', description: '默认关闭。开启后，官方清单之外、但向 Windows 系统媒体控件上报会话的播放器也纳入陪听（视频/图片类会话除外）。有官方或已保存的播放器正在播放时不会接管；没有时未知播放器才参与，只有它一个会话时暂停也允许兜底。可在「连接检查」把常用软件保存为支持播放器；关闭时未保存的未知播放器不参与，「连接检查」仍会列出它们的会话。', 'x-hot': false },
+        'worlds.netease-music.windowFallback': { type: 'boolean', title: '启用窗口标题降级（Linux 上无效）', description: 'Windows 版在 SMTC 不可用时读取窗口标题；Linux 版只读 MPRIS，这个开关不起作用。', 'x-hot': false },
+        'worlds.netease-music.autoDetect': { type: 'boolean', title: '通用识别（重启生效）', description: '默认关闭。开启后，官方清单之外、但在 D-Bus 上发布 MPRIS 会话的播放器（例如 Firefox）也纳入陪听；MPRIS 不区分音乐与视频，开启后网页视频也可能被当成在听歌。有官方或已保存的播放器正在播放时不会接管；没有时未知播放器才参与，只有它一个会话时暂停也允许兜底。可在「连接检查」把常用软件保存为支持播放器；关闭时未保存的未知播放器不参与，「连接检查」仍会列出它们的会话。', 'x-hot': false },
         'worlds.netease-music.autoBlacklist': { type: 'string', title: '通用识别黑名单（重启生效）', description: '不想让通用识别接管的软件，填应用 ID 或名称关键词（如 msteams、zoom、wemeetapp），逗号、分号或换行分隔；关键词需是完整片段，避免误伤名称相近的软件。默认已屏蔽常见会议/办公软件，可在「连接检查」一键移出。', 'x-hot': false },
       },
     },
